@@ -13,9 +13,18 @@ use std::env;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 const DEFAULT_PORT: u16 = 64000;
+
+/// Events sent to the chat loop by the keyboard and network threads.
+enum ChatEvent {
+    KeyboardInput(String),
+    PeerMessage(String),
+    PeerDisconnected,
+    KeyboardClosed,
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -41,8 +50,9 @@ fn main() {
 
 /// Start the listening side of the chat.
 ///
-/// By default, the server listens on every local network interface at port
-/// 64000. A custom bind address can be supplied, such as `127.0.0.1:64000`.
+/// The keyboard reader is created once and reused. This lets the server return
+/// to `accept` after a client leaves, while keeping the same server terminal
+/// available for the next client.
 fn run_server(bind_address: Option<&str>) {
     let address = bind_address
         .map(str::to_owned)
@@ -53,23 +63,28 @@ fn run_server(bind_address: Option<&str>) {
         process::exit(1);
     });
 
+    let (input_sender, input_receiver) = mpsc::channel();
+    spawn_keyboard_reader(input_sender);
+
     println!("Listening on {address}");
-    println!("Waiting for one chat client...");
 
-    // `accept` returns the TCP stream and the remote address of the client.
-    let (stream, peer) = listener.accept().unwrap_or_else(|error| {
-        eprintln!("Could not accept a connection: {error}");
-        process::exit(1);
-    });
+    // Keep accepting clients until the server's terminal reaches EOF or an
+    // unrecoverable connection error occurs.
+    loop {
+        println!("Waiting for a chat client...");
 
-    println!("Connected to {peer}");
-    run_chat(stream);
+        let (stream, peer) = listener.accept().unwrap_or_else(|error| {
+            eprintln!("Could not accept a connection: {error}");
+            process::exit(1);
+        });
+
+        println!("Connected to {peer}");
+        run_chat(stream, &input_receiver);
+        println!("Ready for another client.");
+    }
 }
 
 /// Start the connecting side of the chat.
-///
-/// The client accepts either an IP address/host name or a complete socket
-/// address. For example, both `127.0.0.1` and `127.0.0.1:64000` work.
 fn run_client(args: &[String]) {
     if args.len() < 3 || args.len() > 4 {
         eprintln!("Client mode needs a server address.");
@@ -91,24 +106,62 @@ fn run_client(args: &[String]) {
     });
 
     println!("Connected to {address}");
-    run_chat(stream);
+
+    let (input_sender, input_receiver) = mpsc::channel();
+    spawn_keyboard_reader(input_sender);
+    run_chat(stream, &input_receiver);
+}
+
+/// Read keyboard input on its own thread and send each line to the chat loop.
+///
+/// The server keeps this thread alive between connections. A client process
+/// exits after `/quit`, so its keyboard thread naturally ends with the process.
+fn spawn_keyboard_reader(sender: Sender<ChatEvent>) {
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            match line {
+                Ok(message) => {
+                    if sender.send(ChatEvent::KeyboardInput(message)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Could not read keyboard input: {error}");
+                    let _ = sender.send(ChatEvent::KeyboardClosed);
+                    break;
+                }
+            }
+        }
+
+        let _ = sender.send(ChatEvent::KeyboardClosed);
+    });
 }
 
 /// Run the shared chat logic once a TCP connection exists.
 ///
-/// The stream is cloned so the program can read and write at the same time:
-/// the main thread sends keyboard input, while a reader thread receives peer
-/// messages.
-fn run_chat(stream: TcpStream) {
+/// The network stream is cloned so a reader thread can receive messages while
+/// this function handles keyboard events and sends messages. When either side
+/// quits, the stream is shut down and this function returns. In server mode,
+/// that return sends control back to the loop that accepts the next client.
+fn run_chat(stream: TcpStream, input_receiver: &Receiver<ChatEvent>) {
     let reader_stream = stream.try_clone().expect("Could not clone the TCP stream");
+    let (event_sender, event_receiver) = mpsc::channel();
 
+    // Forward network events into the same event loop as keyboard input.
+    let network_sender = event_sender.clone();
     let reader_thread = thread::spawn(move || {
         let reader = BufReader::new(reader_stream);
 
-        // `lines` waits until a complete newline-terminated message arrives.
         for message in reader.lines() {
             match message {
-                Ok(message) => println!("\nPeer: {message}\nYou: "),
+                Ok(message) => {
+                    if network_sender
+                        .send(ChatEvent::PeerMessage(message))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 Err(error) => {
                     eprintln!("\nCould not read from peer: {error}");
                     break;
@@ -116,47 +169,70 @@ fn run_chat(stream: TcpStream) {
             }
         }
 
-        println!("\nThe other program disconnected.");
+        let _ = network_sender.send(ChatEvent::PeerDisconnected);
     });
 
     println!("Type a message and press Enter. Type /quit to leave.");
-    print!("You: ");
     io::stdout().flush().expect("Could not flush stdout");
 
-    let stdin = io::stdin();
     let mut writer = stream;
 
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(message) => {
-                if message == "/quit" {
+    loop {
+        // Check keyboard input first so `/quit` closes this terminal promptly.
+        match input_receiver.try_recv() {
+            Ok(event) => {
+                if handle_keyboard_event(event, &mut writer) {
                     break;
                 }
-
-                if let Err(error) = writeln!(writer, "{message}") {
-                    eprintln!("Could not send message: {error}");
-                    break;
-                }
-
-                if let Err(error) = writer.flush() {
-                    eprintln!("Could not flush message: {error}");
-                    break;
-                }
-
-                print!("You: ");
-                io::stdout().flush().expect("Could not flush stdout");
             }
-            Err(error) => {
-                eprintln!("Could not read keyboard input: {error}");
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        // Wait briefly for a network event. The timeout lets us continue
+        // checking the keyboard channel without blocking forever.
+        match event_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(ChatEvent::PeerMessage(message)) => println!("\nPeer: {message}"),
+            Ok(ChatEvent::PeerDisconnected) => {
+                println!("\nThe other program disconnected.");
                 break;
             }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
-    // Closing both halves tells the peer that this user is finished.
+    // This unblocks the network reader thread so it can finish cleanly.
     let _ = writer.shutdown(Shutdown::Both);
     let _ = reader_thread.join();
     println!("Chat ended.");
+}
+
+/// Send keyboard messages and report whether the chat should end.
+fn handle_keyboard_event(event: ChatEvent, writer: &mut TcpStream) -> bool {
+    match event {
+        ChatEvent::KeyboardInput(message) => {
+            if message == "/quit" {
+                return true;
+            }
+
+            if let Err(error) = writeln!(writer, "{message}") {
+                eprintln!("Could not send message: {error}");
+                return true;
+            }
+
+            if let Err(error) = writer.flush() {
+                eprintln!("Could not flush message: {error}");
+                return true;
+            }
+
+            io::stdout().flush().expect("Could not flush stdout");
+            false
+        }
+        ChatEvent::KeyboardClosed => true,
+        _ => false,
+    }
 }
 
 fn print_usage(program: &str) {
