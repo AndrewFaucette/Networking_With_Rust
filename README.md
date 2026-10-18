@@ -1,79 +1,37 @@
 # Networking With Rust
 
-This project is a simple two-person chat application written in Rust. It uses
-the standard library's `TcpListener` and `TcpStream` types, so it does not need
-external crates.
+A Client-Server chat application. The application is run in two terminals, one configured to be the client, and the other to be the server.
 
-## How the program is structured
+## Instructions for Build and Use
 
-The same executable can run in two modes:
+Steps to build and/or run the software:
 
-- **Server mode** binds to a local address, listens for a TCP connection, and
-  accepts one client.
-- **Client mode** connects to the server's IP address and port.
-- **Chat mode** is shared by both sides after they connect. The TCP stream is
-  cloned so one thread can receive messages while the main thread reads and
-  sends keyboard input.
+1. Run `cargo build` in the `chat` directory to build the code (or you can just find and run the executable in the `target` folder).
+2. Navigate to the `chat` directory in two seperate terminals.
+3. run `cargo run -- server` in one terminal and `cargo run -- client 127.0.0.1` in the other terminal.
 
-Messages are sent as UTF-8 text with a newline at the end. The newline gives
-the receiver a simple message boundary, which is important because TCP is a
-continuous byte stream rather than a message-by-message protocol.
+Instructions for using the software:
 
-## Build
+1. You can send messages in either terminal and they will be recieved by the other.
 
-Install Rust from [rustup.rs](https://rustup.rs/), then build from the `chat`
-directory:
+## Development Environment
 
-```text
-cd CSE310/Networking_With_Rust/chat
-cargo build
-```
+To recreate the development environment, you need the following software and/or libraries with the specified versions:
 
-## Run two programs on one computer
+* Rust v1.98.1
+* Cargo v1.98.1
 
-Open two terminals in the `chat` directory. Start the server in the first:
+## Useful Websites to Learn More
 
-```text
-cargo run -- server
-```
+I found these websites useful in developing this software:
 
-Start the client in the second:
+* [Beginner's Rust Tutorial: Networking for First Time Students](https://youtu.be/p9wU1uBuhQ8?si=idvTm53Sc1J5Q8b6)
+* [Rust for Network Programming](https://dev.to/godofgeeks/rust-for-network-programming-1en5)
 
-```text
-cargo run -- client 127.0.0.1
-```
+## Future Work
 
-Type a message and press Enter. Both programs can send messages at the same
-time. Type `/quit` to close the connection.
+The following items I plan to fix, improve, and/or add to this project in the future:
 
-## Run across two computers
-
-1. On the host computer, run `cargo run -- server`.
-2. Find the host computer's local IP address, such as `192.168.1.25`.
-3. On the other computer, run `cargo run -- client 192.168.1.25`.
-4. Allow TCP port `64000` through the host computer's firewall if prompted.
-
-The two computers should be on the same network unless the port is deliberately
-made reachable through a router or other network configuration.
-
-You can use a different port as well:
-
-```text
-cargo run -- server 0.0.0.0:65000
-cargo run -- client 192.168.1.25 65000
-```
-
-## Useful Rust concepts demonstrated
-
-- `TcpListener::bind` and `TcpStream::connect` for TCP networking
-- `TcpStream::try_clone` for independent reading and writing
-- `std::thread::spawn` for receiving while the user types
-- `BufReader::lines` for newline-delimited messages
-- `Result` handling for connection, input, and network errors
-
-## Future work
-
-- [ ] Support multiple clients in a shared chat room
-- [ ] Add usernames and timestamps
-- [ ] Add a cleaner terminal display for incoming messages
-- [ ] Add encrypted communication with TLS
+* [ ] Add functionality for more than two people in the chat
+* [ ] Create a version that is strictly peer-to-peer instead of client-server
+* [ ] Automatically configure the first run terminal as the client to avoid user configuration at runtime
